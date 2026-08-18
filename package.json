@@ -1,0 +1,31 @@
+{
+  "name": "globalpanelhealth",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "pkg . --target node18-win-x64 --output GlobalPanelHealth.exe"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "mammoth": "^1.12.1",
+    "mysql2": "^3.22.5",
+    "xlsx": "^0.18.5"
+  },
+  "bin": "universal_server.js",
+  "pkg": {
+    "assets": [
+      "decoders/**/*",
+      "config/**/*",
+      "protocols/**/*",
+      "routes/**/*"
+    ]
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}

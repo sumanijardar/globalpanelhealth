@@ -1,0 +1,39 @@
+{
+  "database": {
+    "host": "10.15.10.194",
+    "port": 3306,
+    "user": "sarsafe2",
+    "password": "Sarsoft@2026#",
+    "database": "esurv",
+    "waitForConnections": true,
+    "connectionLimit": 10,
+    "queueLimit": 0
+  },
+  "api_port": 3000,
+  "protocols": {
+    "mayur": {
+      "enabled": true,
+      "port": 9999
+    },
+    "rass": {
+      "enabled": true,
+      "port": 6550
+    },
+    "smarti": {
+      "enabled": true,
+      "port": 5500
+    },
+    "rax": {
+      "enabled": true,
+      "port": 5502
+    },
+    "securico": {
+      "enabled": true,
+      "port": 5503
+    },
+    "intellitech": {
+      "enabled": true,
+      "port": 3001
+    }
+  }
+}
