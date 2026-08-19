@@ -1,21 +1,18 @@
 const net = require("net");
 const pool = require("../config/database");
-const { panelConfigCache } = require("../config/routing");
-const decodeSIA = require("../decoders/smarti_decoder");
+const decoders = require("../decoders");
+const decodeSIA = decoders.smarti;
+const healthEvents = require("../services/health_events");
 
 const TCP_PORT = 5500;
 
-
-const activeSockets = new Map();   // account -> socket
+const activeSockets = new Map();
 const eventLog = [];
 const MAX_LOG = 100;
-const commandQueue = new Map();    // account -> [{ command, zone, resolve, queuedAt }]
-const connectWaiters = new Map();  // account -> [resolve]
+const commandQueue = new Map();
+const connectWaiters = new Map();
 let outSequence = 1;
 
-// =================================================
-// SIA DC-09 Protocol Helpers
-// =================================================
 function calculateCRC16(str) {
   let crc = 0x0000;
   for (let i = 0; i < str.length; i++) {
@@ -39,7 +36,7 @@ function getTimestamp() {
 }
 
 function parseSIAHeader(message) {
-  const match = message.match(/^([0-9A-Fa-f]{4})([0-9A-Fa-f]{4})"(.*?)"(\\d{4})(R\\w+)(L\\w+)#(\\w+)/);
+  const match = message.match(/^([0-9A-Fa-f]{4})([0-9A-Fa-f]{4})"(.*?)"(\d{4})(R\w+)(L\w+)#(\w+)/);
   if (match) {
     return {
       crc: match[1],
@@ -62,89 +59,69 @@ function buildACK(header) {
   return `\n${crc}${len}${body}\r`;
 }
 
-// Commands mapping based on 8IO ATM G1 32 Zone protocol
+// Commands mapping for SMARTI / ZICOM Health Status
 const COMMAND_MAP = {
-  'ARM': 'NCF001',       // Full System Arm
-  'DISARM': 'NOF001',    // Full System Disarm
-  'STAY': 'NCP001',      // System Partial Arm
-  
-  // Siren Control (Output 2)
-  'SIREN_ON': '[N|002|1]',
-  'SIREN_OFF': '[N|002|0]',
-  'HOOTER': '[N|002|1]', 
-  
-  // AC Control (Output 5 for AC1, Output 6 for AC2)
-  'AC1_ON': '[N|005|1]',
-  'AC1_OFF': '[N|005|0]',
-  'AC1': '[N|005|1]',
-  'AC2_ON': '[N|006|1]',
-  'AC2_OFF': '[N|006|0]',
-  'AC2': '[N|006|1]',
-  
-  // Signage Light Control (Output 8)
-  'LIGHT_ON': '[N|008|1]',
-  'LIGHT_OFF': '[N|008|0]',
-  'LIGHT1_ON': '[N|008|1]',
-  'LIGHT1_OFF': '[N|008|0]',
-  
-  // Reset and Status Commands
-  'RESET': '[N|000]',
-  'STATUS': 'NYY040',    // Query zone status (if supported)
-  'RELAY_ON': 'NZH',     // New Output ON prefix (NZH + zone)
-  'RELAY_OFF': 'NZL'     // New Output OFF prefix (NZL + zone)
+  'READ_ZONE_STATUS': 'NYY040',
+  'READ_PORT_STATUS': 'NYY040',
+  'STATUS': 'NYY040',
+  'READ_RELAY_STATUS': 'READ_RELAY_STATUS',
+  'READ_OUTPUT_STATUS': 'READ_RELAY_STATUS'
 };
 
 function buildSIACommand(commandType, account, zone = "000", receiver = "R000001", line = "L000000") {
-  const commandPayload = COMMAND_MAP[commandType.toUpperCase()];
-  if (!commandPayload) return null;
-
+  const cmd = commandType.toUpperCase();
   const seq = String(outSequence++).padStart(4, '0');
   if (outSequence > 9999) outSequence = 1;
   const ts = getTimestamp();
-
-  // Zicom panels strictly expect a 6-digit account number (e.g., #040205 instead of #40205)
   const paddedAccount = String(account).padStart(6, '0');
 
   let dataWithoutTs;
-
-  if (commandPayload.startsWith('[')) {
-    // If it's an extended payload (like ARM: [N|005|A]), format with NYY005
-    dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|NYY005]${commandPayload}`;
+  if (cmd === 'READ_RELAY_STATUS' || cmd === 'READ_OUTPUT_STATUS') {
+    const outNum = Number(zone) > 0 ? String(Number(zone)).padStart(2, '0') : '01';
+    dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|NYY005][N|005|${outNum}|R]`;
   } else {
-    // If it's an internal code (like NRC, NRO, NYY040)
-    // If it's already 6 chars like NYY040, use it as is. Otherwise, append zone (e.g. NRC + 041)
-    const innerCode = commandPayload.length === 6 ? commandPayload : `${commandPayload}${zone}`;
-    dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|${innerCode}]`;
+    // Zone status query NYY040
+    dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|NYY040]`;
   }
 
   const dataWithTs = dataWithoutTs + '_' + ts;
   const crc = calculateCRC16(dataWithTs);
   const len = calculateLength(dataWithTs);
-  const result = `\n${crc}${len}${dataWithTs}\r`;
-
-  console.log(`\n🛠️  [CONSTRUCTED SMARTI SIA COMMAND] Type: ${commandType}, Account: ${paddedAccount}`);
-  return result;
+  return `\n${crc}${len}${dataWithTs}\r`;
 }
 
 function sendCommandToPanel(socket, commandType, accountNo, zone = "000") {
-  if (socket.destroyed) {
+  if (!socket || socket.destroyed) {
     console.log("❌ SMARTI Connection lost, cannot send command.");
     return false;
   }
-  const cmd = buildSIACommand(commandType, accountNo, zone);
-  if (!cmd) {
-    console.log(`⚠️ SMARTI Unknown Command: ${commandType}`);
-    return false;
+
+  const cmd = commandType.toUpperCase();
+  if (cmd === 'READ_RELAY_STATUS' || cmd === 'READ_OUTPUT_STATUS') {
+    const outNum = Number(zone);
+    if (!outNum || outNum <= 0) {
+      console.log(`\n🔄 [SMARTI] Reading all relay statuses (Relay 01 to 08) for Panel #${accountNo}...`);
+      for (let i = 1; i <= 8; i++) {
+        setTimeout(() => {
+          if (socket && !socket.destroyed) {
+            const singleCmd = buildSIACommand('READ_RELAY_STATUS', accountNo, String(i));
+            socket.write(singleCmd);
+          }
+        }, (i - 1) * 800);
+      }
+      return true;
+    }
   }
-  socket.write(cmd);
-  console.log(`\n📤 [SMARTI] Command Sent [${commandType}]:`);
-  console.log(`   Raw Format: ${cmd.replace(/\\n/g, '\\\\n').replace(/\\r/g, '\\\\r')}`);
+
+  const cmdPayload = buildSIACommand(commandType, accountNo, zone);
+  if (!cmdPayload) return false;
+
+  socket.write(cmdPayload);
+  console.log(`\n📤 [SMARTI] Command Sent [${commandType}] for Panel #${accountNo}:`);
+  console.log(`   Raw Format: ${cmdPayload.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}`);
   return true;
 }
 
-// ==========================================
-// 1. TCP SERVER
-// ==========================================
 function handleSocketEvents(socket, remoteIp, initialAccount = null) {
   let currentAccount = initialAccount;
   socket.setKeepAlive(true, 30000);
@@ -167,15 +144,6 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
       decoded.account = header.account;
     }
 
-    let crcOK = false, lenOK = false;
-    if (header) {
-      const dataBody = message.substring(8);
-      const calculatedCRC = calculateCRC16(dataBody);
-      const calculatedLen = calculateLength(dataBody);
-      crcOK = header.crc.toUpperCase() === calculatedCRC.toUpperCase();
-      lenOK = header.length.toUpperCase() === calculatedLen.toUpperCase();
-    }
-
     if (decoded.account) {
       currentAccount = decoded.account;
       activeSockets.set(currentAccount, socket);
@@ -185,61 +153,137 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
         for (const resolve of waiters) resolve({ account: currentAccount });
         connectWaiters.set(currentAccount, []);
       }
+    }
 
-      if (decoded.code) {
-        const seqno = header ? header.sequence : '0000';
-        const alarmCode = decoded.code;
+    // -------------------------------------------------
+    // 💾 Save Zone Statuses into panel_health
+    // -------------------------------------------------
+    const zoneItems = decoded.sensors || decoded.zonesList;
+    if (zoneItems && Array.isArray(zoneItems) && zoneItems.length > 0 && currentAccount) {
+      try {
         const receivedtime = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-        let priority = 'N', level = 0, targetTable = 'alerts';
-        const configsArray = panelConfigCache.get('SMARTI'); // Or use account specific
-
-        if (configsArray) {
-          let matchedConfig = null;
-          for (const config of configsArray) {
-            if (config.alarmCodeArr.includes(alarmCode)) {
-              matchedConfig = config;
-              break;
-            }
-          }
-
-          if (matchedConfig) {
-            if (matchedConfig.destination === 'back') {
-              targetTable = 'backalerts';
-            } else if (matchedConfig.destination === 'front') {
-              targetTable = 'alerts';
-              if (matchedConfig.level1Arr.includes(alarmCode)) { level = 1; priority = 'Y'; }
-              else if (matchedConfig.level2Arr.includes(alarmCode)) { level = 2; priority = 'Y'; }
-              else if (matchedConfig.level3Arr.includes(alarmCode)) { level = 3; priority = 'Y'; }
-              else { level = 0; priority = matchedConfig.rowPriority; }
-            }
-          }
-        }
-
-        const baseValues = [
-          currentAccount, seqno, decoded.zone || '000', alarmCode,
-          decoded.formattedDate || receivedtime, decoded.event || ''
-        ];
-
+        let panelName = 'SMARTI';
         try {
-          await pool.query(`INSERT INTO alerts_copy (panelid, seqno, zone, alarm, createtime, alerttype, status) VALUES (?, ?, ?, ?, ?, ?,'O')`, baseValues);
+          const [siteRows] = await pool.query("SELECT Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1", [currentAccount]);
+          if (siteRows && siteRows.length > 0) panelName = siteRows[0].Panel_Make || 'SMARTI';
         } catch (err) { }
 
-        try {
-          await pool.query(`INSERT INTO ${targetTable} (panelid, seqno, zone, alarm, createtime, alerttype, status, priority, level) VALUES (?, ?, ?, ?, ?, ?, 'O', ?, ?)`, [...baseValues, priority, level]);
-          console.log(`✅ [SMARTI] Data successfully saved to ${targetTable} (Alarm: ${alarmCode})`);
-        } catch (err) {
-          console.error(`❌ DB Error (${targetTable}):`, err.message);
+        let columns = ['panelid', 'udate', 'ip', 'panelName'];
+        let placeholders = ['?', '?', '?', '?'];
+        let values = [currentAccount, receivedtime, remoteIp || '', panelName];
+        let setQueryArr = ['udate = ?', 'ip = ?', 'panelName = ?'];
+        let setValues = [receivedtime, remoteIp || '', panelName];
+
+        zoneItems.forEach(z => {
+          const zNum = parseInt(z.zone, 10);
+          if (zNum >= 1 && zNum <= 60) {
+            const colName = `zon${zNum}`;
+            const stVal = z.description || z.statusDescription || z.status || '0';
+            columns.push(colName);
+            placeholders.push('?');
+            values.push(stVal);
+            setQueryArr.push(`${colName} = ?`);
+            setValues.push(stVal);
+          }
+        });
+
+        const [rows] = await pool.query("SELECT id FROM panel_health WHERE panelid = ? LIMIT 1", [currentAccount]);
+        if (rows && rows.length > 0) {
+          const updateQuery = `UPDATE panel_health SET ${setQueryArr.join(', ')} WHERE panelid = ?`;
+          await pool.query(updateQuery, [...setValues, currentAccount]);
+          console.log(`✅ [SMARTI] Zone status (${zoneItems.length} zones) UPDATED in panel_health for Panel #${currentAccount}`);
+        } else {
+          const insertQuery = `INSERT INTO panel_health (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
+          await pool.query(insertQuery, values);
+          console.log(`✅ [SMARTI] Zone status (${zoneItems.length} zones) INSERTED into panel_health for Panel #${currentAccount}`);
         }
+
+        healthEvents.emit('health_saved', {
+          account: currentAccount,
+          make: panelName,
+          type: 'zone',
+          count: zoneItems.length,
+          timestamp: receivedtime
+        });
+      } catch (dbErr) {
+        console.error(`❌ [SMARTI] DB Error saving zone status to panel_health:`, dbErr.message);
       }
     }
 
-    eventLog.unshift({
-      ...decoded,
-      raw: message,
-      crcValid: crcOK,
-      receivedAt: new Date().toISOString()
-    });
+    // -------------------------------------------------
+    // 💾 Save Output / Relay Statuses into panel_health
+    // -------------------------------------------------
+    const relayItems = decoded.channelList || decoded.relayList || decoded.outputs;
+    if (((relayItems && Array.isArray(relayItems) && relayItems.length > 0) || (decoded.outputNo !== undefined && decoded.outputNo !== null)) && currentAccount) {
+      try {
+        const receivedtime = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        let panelName = 'SMARTI';
+        try {
+          const [siteRows] = await pool.query("SELECT Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1", [currentAccount]);
+          if (siteRows && siteRows.length > 0) panelName = siteRows[0].Panel_Make || 'SMARTI';
+        } catch (err) { }
+
+        let columns = ['panelid', 'udate', 'ip', 'panelName'];
+        let placeholders = ['?', '?', '?', '?'];
+        let values = [currentAccount, receivedtime, remoteIp || '', panelName];
+        let setQueryArr = ['udate = ?', 'ip = ?', 'panelName = ?'];
+        let setValues = [receivedtime, remoteIp || '', panelName];
+
+        let relayCount = 0;
+        if (relayItems && Array.isArray(relayItems)) {
+          relayCount = relayItems.length;
+          relayItems.forEach(c => {
+            const ch = parseInt(c.channel || c.relayId || c.output, 10);
+            if (ch >= 1 && ch <= 20) {
+              const colName = `relay${ch}`;
+              let stVal = c.status !== undefined ? c.status : c.state;
+              stVal = (stVal === 'ON' || stVal === '1' || stVal === 1) ? '1' : '0';
+              columns.push(colName);
+              placeholders.push('?');
+              values.push(stVal);
+              setQueryArr.push(`${colName} = ?`);
+              setValues.push(stVal);
+            }
+          });
+        } else if (decoded.outputNo !== undefined && decoded.outputNo !== null) {
+          relayCount = 1;
+          const ch = parseInt(decoded.outputNo, 10);
+          if (ch >= 1 && ch <= 20) {
+            const colName = `relay${ch}`;
+            let stVal = decoded.outputState;
+            stVal = (stVal === 'ON' || stVal === '1' || stVal === 1) ? '1' : '0';
+            columns.push(colName);
+            placeholders.push('?');
+            values.push(stVal);
+            setQueryArr.push(`${colName} = ?`);
+            setValues.push(stVal);
+          }
+        }
+
+        const [rows] = await pool.query("SELECT id FROM panel_health WHERE panelid = ? LIMIT 1", [currentAccount]);
+        if (rows && rows.length > 0) {
+          const updateQuery = `UPDATE panel_health SET ${setQueryArr.join(', ')} WHERE panelid = ?`;
+          await pool.query(updateQuery, [...setValues, currentAccount]);
+          console.log(`✅ [SMARTI] Relay status UPDATED in panel_health for Panel #${currentAccount}`);
+        } else {
+          const insertQuery = `INSERT INTO panel_health (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
+          await pool.query(insertQuery, values);
+          console.log(`✅ [SMARTI] Relay status INSERTED into panel_health for Panel #${currentAccount}`);
+        }
+
+        healthEvents.emit('health_saved', {
+          account: currentAccount,
+          make: panelName,
+          type: 'relay',
+          count: relayCount,
+          timestamp: receivedtime
+        });
+      } catch (dbErr) {
+        console.error(`❌ [SMARTI] DB Error saving relay status to panel_health:`, dbErr.message);
+      }
+    }
+
+    eventLog.unshift({ ...decoded, raw: message, receivedAt: new Date().toISOString() });
     if (eventLog.length > MAX_LOG) eventLog.pop();
 
     if (header && !socket.destroyed) {
@@ -250,13 +294,10 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
           const pending = [...queue];
           commandQueue.set(currentAccount, []);
           for (const item of pending) {
-            const cmd = buildSIACommand(item.command, currentAccount, item.zone || '000');
-            if (cmd) {
-              socket.write(cmd);
+            const success = sendCommandToPanel(socket, item.command, currentAccount, item.zone || '000');
+            if (success) {
               commandSentFromQueue = true;
-              if (item.resolve) item.resolve({ sent: true, command: item.command, zone: item.zone || '000', sentAt: new Date().toISOString() });
-            } else {
-              if (item.resolve) item.resolve({ sent: false, command: item.command });
+              if (item.resolve) item.resolve({ sent: true, command: item.command, zone: item.zone || '000' });
             }
           }
         }
@@ -264,7 +305,6 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
       if (!commandSentFromQueue && !message.includes('"ACK"')) {
         const ackMsg = buildACK(header);
         socket.write(ackMsg);
-        console.log(`📤 [SMARTI] ACK Sent: ${ackMsg.trim()}`);
       }
     }
   });
@@ -275,30 +315,23 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
 }
 
 function initiatePanelConnection(panelId, ip) {
-  const OUTGOING_PORT = 5000;
-  console.log(`\n⏳ [SMARTI] Attempting OUTGOING connection to Panel #${panelId} at IP: ${ip}:${OUTGOING_PORT}...`);
+  console.log(`\n⏳ [SMARTI] Attempting OUTGOING connection to Panel #${panelId} at IP: ${ip}:${TCP_PORT}...`);
   const socket = new net.Socket();
 
-  socket.connect(OUTGOING_PORT, ip, () => {
+  socket.connect(TCP_PORT, ip, () => {
     console.log(`✅ [SMARTI] Successfully connected to Panel #${panelId} (${ip})`);
     activeSockets.set(panelId, socket);
     handleSocketEvents(socket, ip, panelId);
 
-    // Check and process pending commands with a short delay to allow panel readiness
-    setTimeout(() => {
-      if (socket.destroyed) return;
-      const queue = commandQueue.get(panelId);
-      if (queue && queue.length > 0) {
-        const pending = [...queue];
-        commandQueue.set(panelId, []);
-        for (const item of pending) {
-          const success = sendCommandToPanel(socket, item.command, panelId, item.zone || '000');
-          if (item.resolve) {
-            item.resolve({ sent: success, command: item.command, zone: item.zone || '000', sentAt: new Date().toISOString() });
-          }
-        }
+    const queue = commandQueue.get(panelId);
+    if (queue && queue.length > 0) {
+      const pending = [...queue];
+      commandQueue.set(panelId, []);
+      for (const item of pending) {
+        const success = sendCommandToPanel(socket, item.command, panelId, item.zone || '000');
+        if (item.resolve) item.resolve({ sent: success, command: item.command, zone: item.zone || '000' });
       }
-    }, 1500); // 1.5 second delay
+    }
   });
 
   socket.on("error", (err) => {
@@ -306,143 +339,12 @@ function initiatePanelConnection(panelId, ip) {
   });
 
   socket.on("close", () => {
-    console.log(`⚠️ [SMARTI] Connection closed for Panel #${panelId} (${ip}). Retrying in 3 minutes...`);
-    setTimeout(() => {
-      if (!activeSockets.has(panelId) || activeSockets.get(panelId).destroyed) {
-        initiatePanelConnection(panelId, ip);
-      }
-    }, 180000); // 3 minutes
+    activeSockets.delete(panelId);
   });
-}
-
-async function connectToAllPanels() {
-  try {
-    const [rows] = await pool.query("SELECT NewPanelID, dvrip FROM sites WHERE Panel_Make LIKE '%smart%' AND dvrip IS NOT NULL AND dvrip != '' ");
-    if (rows && rows.length > 0) {
-      console.log(`\n🔄 [SMARTI] Found ${rows.length} smart panels with IPs in database. Initiating outgoing connections...`);
-      for (const row of rows) {
-        const panelId = String(row.NewPanelID).trim();
-        const ip = String(row.dvrip).trim();
-        if (!activeSockets.has(panelId)) initiatePanelConnection(panelId, ip);
-      }
-    } else {
-      console.log(`\nℹ️ [SMARTI] No smart panels found in database with valid IP for outgoing connection.`);
-    }
-  } catch (err) {
-    console.error(`❌ [SMARTI] Error fetching panels from DB for outgoing connections:`, err.message);
-  }
-}
-
-let smartiHealthLoopStarted = false;
-
-async function savePanelHealthToDb(panelId, ip, panelMake) {
-  try {
-    const receivedtime = new Date().toISOString().slice(0, 19).replace('T', ' ');
-    const [rows] = await pool.query("SELECT id FROM panel_health WHERE panelid = ? LIMIT 1", [panelId]);
-    if (rows && rows.length > 0) {
-      await pool.query(
-        "UPDATE panel_health SET udate = ?, ip = ?, panelName = ? WHERE panelid = ?",
-        [receivedtime, ip || '', panelMake || 'SMARTI', panelId]
-      );
-      console.log(`💾 [${panelMake}] Panel Health Data UPDATED in 'panel_health' table for Panel #${panelId}`);
-    } else {
-      await pool.query(
-        "INSERT INTO panel_health (panelid, udate, ip, panelName) VALUES (?, ?, ?, ?)",
-        [panelId, receivedtime, ip || '', panelMake || 'SMARTI']
-      );
-      console.log(`💾 [${panelMake}] Panel Health Data INSERTED into 'panel_health' table for Panel #${panelId}`);
-    }
-  } catch (dbErr) {
-    console.error(`❌ [${panelMake}] DB Error updating panel_health for Panel #${panelId}:`, dbErr.message);
-  }
-}
-
-function querySingleSmartiPanelHealth(panelId, ip, currentIndex, totalPanels) {
-  return new Promise(async (resolve) => {
-    console.log(`\n--------------------------------------------------`);
-    console.log(`⏳ [SMARTI] [${currentIndex}/${totalPanels}] Fetched Panel #${panelId} (IP: ${ip}) from 'sites' table.`);
-
-    const existingSocket = activeSockets.get(panelId);
-    if (existingSocket && !existingSocket.destroyed) {
-      console.log(`✅ [SMARTI] Panel #${panelId} is ONLINE (Active Connection).`);
-      await savePanelHealthToDb(panelId, ip, 'SMARTI');
-      console.log(`--------------------------------------------------`);
-      return resolve();
-    }
-
-    console.log(`📡 [SMARTI] Connecting to Panel #${panelId} at IP: ${ip}:${TCP_PORT}...`);
-    const socket = new net.Socket();
-    let completed = false;
-
-    const finish = (reason) => {
-      if (!completed) {
-        completed = true;
-        try { socket.destroy(); } catch (e) {}
-        activeSockets.delete(panelId);
-        console.log(`🏁 [SMARTI] Panel #${panelId} -> ${reason}`);
-        console.log(`--------------------------------------------------`);
-        resolve();
-      }
-    };
-
-    const timer = setTimeout(() => finish("❌ Offline (Connection Timeout) - Skipping DB Insert"), 3000);
-
-    socket.connect(TCP_PORT, ip, async () => {
-      clearTimeout(timer);
-      console.log(`✅ [SMARTI] Successfully Connected to Panel #${panelId} (${ip})!`);
-      activeSockets.set(panelId, socket);
-      handleSocketEvents(socket, ip, panelId);
-      await savePanelHealthToDb(panelId, ip, 'SMARTI');
-      setTimeout(() => finish("Done"), 2000);
-    });
-
-    socket.on("error", (err) => {
-      clearTimeout(timer);
-      finish(`❌ Offline (${err.code || err.message}) - Skipping DB Insert`);
-    });
-
-    socket.on("close", () => {
-      clearTimeout(timer);
-      finish("Connection Closed");
-    });
-  });
-}
-
-async function startPanelHealthLoop() {
-  if (smartiHealthLoopStarted) return;
-  smartiHealthLoopStarted = true;
-  console.log("\n🔄 [SMARTI] Starting Continuous Sequential Panel Health Polling Loop...");
-
-  while (true) {
-    try {
-      const [rows] = await pool.query(
-        "SELECT NewPanelID, dvrip FROM sites WHERE Panel_Make LIKE '%smart%' AND dvrip IS NOT NULL AND dvrip != '' AND TRIM(dvrip) != ''"
-      );
-
-      if (rows && rows.length > 0) {
-        console.log(`\n📋 [SMARTI LOOP] Loaded ${rows.length} SMARTI panel(s) from 'sites' table. Processing one by one...`);
-        for (let i = 0; i < rows.length; i++) {
-          const panelId = String(rows[i].NewPanelID).trim();
-          const ip = String(rows[i].dvrip).trim();
-
-          await querySingleSmartiPanelHealth(panelId, ip, i + 1, rows.length);
-          await new Promise(r => setTimeout(r, 1000));
-        }
-      } else {
-        console.log(`ℹ️ [SMARTI LOOP] No active SMARTI panels found in 'sites' table. Waiting 10s...`);
-        await new Promise(r => setTimeout(r, 10000));
-      }
-    } catch (err) {
-      console.error(`❌ [SMARTI LOOP] Error during loop execution:`, err.message);
-      await new Promise(r => setTimeout(r, 5000));
-    }
-  }
 }
 
 function startServer(customPort) {
   const port = customPort || TCP_PORT;
-  startPanelHealthLoop();
-
   const tcpServer = net.createServer((socket) => {
     const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^.*:/, '').trim() : null;
     console.log(`\n📡 [SMARTI] Device TCP Connection Initiated from IP: ${remoteIp}`);
@@ -450,95 +352,93 @@ function startServer(customPort) {
   });
 
   tcpServer.listen(port, () => {
-    console.log(`🚀 SMARTI TCP Server listening for devices on port ${port}`);
+    console.log(`📡 SMARTI Protocol Manager listening on TCP Port ${port}`);
   });
+
+  return tcpServer;
 }
 
-// ==========================================
-// 2. API Handlers
-// ==========================================
-function checkConnection(account, maxWait = 60000) {
+function queueCommand(account, command, zone = "000", waitMs = 60000) {
   return new Promise((resolve) => {
-    const sock = activeSockets.get(account);
-    if (sock && !sock.destroyed) {
-      return resolve({ success: true, status: "online" });
+    const socket = activeSockets.get(account);
+    if (socket && !socket.destroyed) {
+      const success = sendCommandToPanel(socket, command, account, zone);
+      return resolve({ success, status: success ? 'sent' : 'send_failed', account, command });
     }
-    if (!connectWaiters.has(account)) connectWaiters.set(account, []);
-    let done = false;
-    connectWaiters.get(account).push(() => {
-      if (!done) { done = true; resolve({ success: true, status: "online" }); }
-    });
+
+    if (!commandQueue.has(account)) commandQueue.set(account, []);
+    const queue = commandQueue.get(account);
+    const item = { command, zone, resolve, queuedAt: Date.now() };
+    queue.push(item);
+
     setTimeout(() => {
-      if (!done) { done = true; resolve({ success: false, status: "timeout" }); }
-    }, maxWait);
+      const currentQ = commandQueue.get(account) || [];
+      const idx = currentQ.indexOf(item);
+      if (idx !== -1) {
+        currentQ.splice(idx, 1);
+        resolve({ success: false, status: 'timeout', account, command });
+      }
+    }, waitMs);
   });
 }
 
-function queueCommand(account, command, zone, maxWait = 60000) {
+function checkConnection(account, waitMs = 100) {
   return new Promise((resolve) => {
-    const sock = activeSockets.get(account);
-    const timeBefore = new Date().toISOString();
-    if (sock && !sock.destroyed) {
-      const success = sendCommandToPanel(sock, command, account, zone);
-      setTimeout(() => {
-        const newEvents = eventLog.filter(e => e.account === account && e.receivedAt > timeBefore);
-        resolve({ success, status: "sent_immediately", panelResponse: newEvents, responseCount: newEvents.length });
-      }, 3000);
-    } else {
-      if (!commandQueue.has(account)) commandQueue.set(account, []);
-      let done = false;
-      commandQueue.get(account).push({
-        command, zone, queuedAt: timeBefore,
-        resolve: (res) => {
-          if (!done) {
-            done = true;
-            setTimeout(() => {
-              const newEvents = eventLog.filter(e => e.account === account && e.receivedAt > (res.sentAt || timeBefore));
-              resolve({ success: res.sent, status: "sent_from_queue", panelResponse: newEvents, responseCount: newEvents.length });
-            }, 3000);
-          }
-        }
-      });
-
-      // Attempt on-demand connection if not already connected
-      pool.query("SELECT dvrip FROM sites WHERE NewPanelID = ? AND dvrip IS NOT NULL AND dvrip != '' LIMIT 1", [account])
-        .then(([rows]) => {
-          if (rows && rows.length > 0) {
-            const ip = String(rows[0].dvrip).trim();
-            console.log(`\n🔄 [SMARTI] On-Demand connection triggered for Panel #${account} (IP: ${ip})`);
-            initiatePanelConnection(account, ip);
-          } else {
-            console.log(`\n⚠️ [SMARTI] Cannot connect on-demand to Panel #${account}: No valid IP found in DB.`);
-          }
-        })
-        .catch(err => console.error(`\n❌ [SMARTI] DB Error while fetching IP for on-demand connection:`, err.message));
-
-      setTimeout(() => {
-        if (!done) {
-          done = true;
-          resolve({ success: false, status: "timeout", message: "Panel did not connect" });
-        }
-      }, maxWait);
+    const socket = activeSockets.get(account);
+    if (socket && !socket.destroyed) {
+      return resolve({ success: true, status: 'connected', account });
     }
+    if (waitMs <= 0) return resolve({ success: false, status: 'disconnected', account });
+
+    if (!connectWaiters.has(account)) connectWaiters.set(account, []);
+    const waiters = connectWaiters.get(account);
+    let resolved = false;
+
+    const onConnect = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve({ success: true, status: 'connected', account });
+      }
+    };
+    waiters.push(onConnect);
+
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = waiters.indexOf(onConnect);
+        if (idx !== -1) waiters.splice(idx, 1);
+        resolve({ success: false, status: 'disconnected', account });
+      }
+    }, waitMs);
   });
 }
 
-function getEvents(account, limit) {
-  let events = account ? eventLog.filter(e => e.account === account) : eventLog;
-  if (limit > 0) events = events.slice(0, limit);
-  return { success: true, count: events.length, events };
+function getEvents(account, lastIndex = 0) {
+  let evts = account ? eventLog.filter(e => e.account === account) : eventLog;
+  if (lastIndex > 0 && lastIndex < evts.length) {
+    evts = evts.slice(0, lastIndex);
+  }
+  return { success: true, count: evts.length, events: evts };
 }
 
 function getStatus() {
   const devices = [];
-  activeSockets.forEach((sock, acct) => { devices.push({ account: acct, connected: !sock.destroyed }); });
+  for (const [account, socket] of activeSockets.entries()) {
+    devices.push({
+      account,
+      connected: socket && !socket.destroyed,
+      remoteAddress: socket.remoteAddress,
+      remotePort: socket.remotePort
+    });
+  }
   return { success: true, devices };
 }
 
 module.exports = {
   startServer,
-  checkConnection,
   queueCommand,
+  checkConnection,
   getEvents,
-  getStatus
+  getStatus,
+  initiatePanelConnection
 };

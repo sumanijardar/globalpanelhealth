@@ -1,21 +1,20 @@
 const net = require("net");
 const pool = require("../config/database");
-const { panelConfigCache } = require("../config/routing");
-const decodeSIA = require("../decoders/securico_decoder");
+const decoders = require("../decoders");
+const decodeSIA = decoders.securico;
+const healthEvents = require("../services/health_events");
 
 const TCP_PORT = 5503;
 
-const activeSockets = new Map();   // account -> socket
+const activeSockets = new Map();
 const eventLog = [];
 const MAX_LOG = 100;
-const commandQueue = new Map();    // account -> [{ command, zone, resolve, queuedAt }]
-const connectWaiters = new Map();  // account -> [resolve]
-const rpsBuffer = new Map();       // account -> { parts: [], rawMessages: [], timeout: timerId }
+const commandQueue = new Map();
+const connectWaiters = new Map();
 let outSequence = 1;
 
-// =================================================
-// SIA DC-09 Protocol Helpers
-// =================================================
+const rpsBuffer = new Map();
+
 function calculateCRC16(str) {
   let crc = 0x0000;
   for (let i = 0; i < str.length; i++) {
@@ -39,101 +38,75 @@ function getTimestamp() {
 }
 
 function parseSIAHeader(message) {
-  const match = message.match(/"(SIA-DCS|ACK)"(\d{4})(R\w+)(L\w+)#(\w+)/);
+  const match = message.match(/^([0-9A-Fa-f]{4})([0-9A-Fa-f]{4})"(.*?)"(\d{4})(R\w+)(L\w+)#(\w+)/);
   if (match) {
-    const prefix = message.substring(0, match.index);
-    let crc = "0000";
-    let length = "0000";
-    if (prefix.length >= 8) {
-      crc = prefix.slice(-8, -4);
-      length = prefix.slice(-4);
-    } else if (prefix.length >= 4) {
-      length = prefix.slice(-4);
-    }
     return {
-      crc,
-      length,
-      protocol: match[1],
-      sequence: match[2],
-      receiver: match[3],
-      line: match[4],
-      account: match[5],
-      matchIndex: match.index
+      crc: match[1],
+      length: match[2],
+      protocol: match[3],
+      sequence: match[4],
+      receiver: match[5],
+      line: match[6],
+      account: match[7],
+      matchIndex: match[0].length - (match[7].length + 1)
     };
   }
   return null;
 }
 
 function buildACK(header) {
-  // SIA standard ACK format, without the timestamp extension
-  const body = `"ACK"${header.sequence}${header.receiver}${header.line}#${header.account}[]`;
+  if (!header) return null;
+  const ts = getTimestamp();
+  const body = `"ACK"${header.sequence}${header.receiver}${header.line}#${header.account}[]_${ts}`;
   const crc = calculateCRC16(body);
   const len = calculateLength(body);
   return `\n${crc}${len}${body}\r`;
 }
 
-
+// Commands mapping for Securico Health Status
 const COMMAND_MAP = {
   // Read Port Status (Zones)
   'READ_PORT_STATUS_1': 'DCS008|R|000', // Zones 1-20
   'READ_PORT_STATUS_2': 'DCS008|R|001', // Zones 21-40
   'READ_PORT_STATUS_3': 'DCS008|R|002', // Zones 41-47
+  'READ_ZONE_STATUS': 'READ_PORT_STATUS',
+  'READ_PORT_STATUS': 'READ_PORT_STATUS',
 
-  // Read Relay Status
-  'READ_RELAY_STATUS': 'DCS009|R|000'
+  // Relay Status Command
+  'READ_RELAY_STATUS': 'DCS009|R|000',
+  'READ_OUTPUT_STATUS': 'DCS009|R|000'
 };
 
 function buildSIACommand(commandType, account, zone = "000", receiver = "R000001", line = "L000000") {
   let commandPayload = COMMAND_MAP[commandType.toUpperCase()];
   if (!commandPayload) return null;
 
-  if (commandPayload.includes('{ZONE}')) {
-    let finalZone = String(zone).padStart(3, '0');
-    // Default to Hooter-2 (002) if zone 000 is passed for SIREN commands
-    if (commandType.toUpperCase().startsWith('SIREN') && finalZone === '000') {
-      finalZone = '002';
-    }
-    commandPayload = commandPayload.replace('{ZONE}', finalZone);
-  }
-
   const seq = String(outSequence++).padStart(4, '0');
   if (outSequence > 9999) outSequence = 1;
   const ts = getTimestamp();
-
-  // Securico panels expect a 6-digit account number (e.g., #040205)
   const paddedAccount = String(account).padStart(6, '0');
 
-  // Excel specifies L000001 and a space before bracket for BYPASS commands
-  if (commandType.toUpperCase().includes('BYPASS')) {
-    line = "L000001";
-    var dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount} [#${paddedAccount}|${commandPayload}]`;
-  } else {
-    // Securico format: [#ACCOUNT|payload]
-    var dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|${commandPayload}]`;
-  }
-
+  const dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|${commandPayload}]`;
   const dataWithTs = dataWithoutTs + '_' + ts;
 
   const crc = calculateCRC16(dataWithTs);
   const len = calculateLength(dataWithTs);
-  const result = `\n${crc}${len}${dataWithTs}\r`;
-
-  console.log(`\n🛠️  [CONSTRUCTED SECURICO SIA COMMAND] Type: ${commandType}, Account: ${paddedAccount}`);
-  return result;
+  return `\n${crc}${len}${dataWithTs}\r`;
 }
 
 function sendCommandToPanel(socket, commandType, accountNo, zone = "000") {
-  if (socket.destroyed) {
+  if (!socket || socket.destroyed) {
     console.log("❌ SECURICO Connection lost, cannot send command.");
     return false;
   }
 
-  // Handle multi-part commands like READ_PORT_STATUS
-  if (commandType.toUpperCase() === 'READ_PORT_STATUS') {
+  const cmdUpper = commandType.toUpperCase();
+
+  // Multi-part Zone Status command
+  if (cmdUpper === 'READ_PORT_STATUS' || cmdUpper === 'READ_ZONE_STATUS') {
     const cmd1 = buildSIACommand('READ_PORT_STATUS_1', accountNo, zone);
     if (cmd1) socket.write(cmd1);
-
-    console.log(`\n📤 [SECURICO] Command Sent [READ_PORT_STATUS_1] (Starting Sequence)`);
+    console.log(`\n📤 [SECURICO] Command Sent [READ_PORT_STATUS_1] (Starting Sequence) for Panel #${accountNo}`);
     return true;
   }
 
@@ -143,18 +116,15 @@ function sendCommandToPanel(socket, commandType, accountNo, zone = "000") {
     return false;
   }
   socket.write(cmd);
-  console.log(`\n📤 [SECURICO] Command Sent [${commandType}]:`);
+  console.log(`\n📤 [SECURICO] Command Sent [${commandType}] for Panel #${accountNo}:`);
   console.log(`   Raw Format: ${cmd.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}`);
   return true;
 }
 
-// ==========================================
-// 1. TCP SERVER
-// ==========================================
 function handleSocketEvents(socket, remoteIp, initialAccount = null) {
   let currentAccount = initialAccount;
   socket.setKeepAlive(true, 30000);
-  socket.setTimeout(60000); // 1 minute timeout
+  socket.setTimeout(60000);
 
   socket.on("timeout", () => socket.destroy());
   socket.on("data", async (data) => {
@@ -173,13 +143,11 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
       decoded.account = header.account;
     }
 
-    let crcOK = false, lenOK = false;
+    let crcOK = false;
     if (header) {
       const dataBody = message.substring(header.matchIndex);
       const calculatedCRC = calculateCRC16(dataBody);
-      const calculatedLen = calculateLength(dataBody);
       crcOK = header.crc.toUpperCase() === calculatedCRC.toUpperCase();
-      lenOK = header.length.toUpperCase() === calculatedLen.toUpperCase();
     }
 
     if (decoded.account) {
@@ -193,35 +161,7 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
       }
     }
 
-    // --- SEND ACK OR PENDING COMMANDS IMMEDIATELY ---
-    if (header && !socket.destroyed) {
-      let commandSentFromQueue = false;
-      if (currentAccount) {
-        const queue = commandQueue.get(currentAccount);
-        if (queue && queue.length > 0) {
-          const pending = [...queue];
-          commandQueue.set(currentAccount, []);
-          for (const item of pending) {
-            const success = sendCommandToPanel(socket, item.command, currentAccount, item.zone || '000');
-            if (success) {
-              commandSentFromQueue = true;
-              if (item.resolve) item.resolve({ sent: true, command: item.command, zone: item.zone || '000', sentAt: new Date().toISOString() });
-            } else {
-              if (item.resolve) item.resolve({ sent: false, command: item.command });
-            }
-          }
-        }
-      }
-      if (!commandSentFromQueue && !message.includes('"ACK"')) {
-        const ackMsg = buildACK(header);
-        if (ackMsg) {
-          socket.write(ackMsg);
-          console.log(`📤 [SECURICO] ACK Sent: ${ackMsg.trim()}`);
-        }
-      }
-    }
-    // ------------------------------------------------
-
+    // Process Zone Status Responses (DCS008 parts)
     if (decoded.code === "RPS_RES" && decoded.zonesList) {
       if (decoded.event && decoded.event.startsWith("Zone Status Response Part")) {
         if (!rpsBuffer.has(currentAccount)) {
@@ -241,33 +181,16 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
         buffer.parts.push(decoded);
         buffer.rawMessages.push(message);
 
-        // Sequential triggering of the next parts via Queue with delay (handles panels that disconnect after replying)
         if (decoded.event.includes("Part 0")) {
-          setTimeout(() => {
-            if (!socket.destroyed) {
-              console.log(`\n⚠️ [SECURICO] Forcing graceful disconnect for Panel #${currentAccount} to prepare for next part...`);
-              socket.end();
-              setTimeout(() => { if (!socket.destroyed) socket.destroy(); }, 1000);
-            }
-          }, 500);
-
           setTimeout(() => {
             console.log(`\n🔄 [SECURICO] Queuing READ_PORT_STATUS_2 for Panel #${currentAccount}...`);
             queueCommand(currentAccount, 'READ_PORT_STATUS_2', "000");
-          }, 4000);
+          }, 1500);
         } else if (decoded.event.includes("Part 1")) {
-          setTimeout(() => {
-            if (!socket.destroyed) {
-              console.log(`\n⚠️ [SECURICO] Forcing graceful disconnect for Panel #${currentAccount} to prepare for next part...`);
-              socket.end();
-              setTimeout(() => { if (!socket.destroyed) socket.destroy(); }, 1000);
-            }
-          }, 500);
-
           setTimeout(() => {
             console.log(`\n🔄 [SECURICO] Queuing READ_PORT_STATUS_3 for Panel #${currentAccount}...`);
             queueCommand(currentAccount, 'READ_PORT_STATUS_3', "000");
-          }, 4000);
+          }, 1500);
         }
 
         if (buffer.parts.length >= 3) {
@@ -275,47 +198,36 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
           mergeAndPushRPS(currentAccount, buffer, crcOK, remoteIp);
           rpsBuffer.delete(currentAccount);
         }
-        return; // Skip normal pushing to eventLog for parts
+        return;
       } else {
-        // Full 47 char response
         await processRpsDb(decoded, currentAccount, remoteIp);
       }
-    } else if (decoded.code === "RLS_RES" && decoded.relayList) {
+    }
+    // Process Relay Status Responses (DCS009)
+    else if (decoded.code === "RLS_RES" && decoded.relayList) {
       try {
         const receivedtime = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-        let panelName = '';
-        let siteId = 0;
+        let panelName = 'SECURICO';
         try {
-          const [siteRows] = await pool.query("SELECT SN, Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1", [currentAccount]);
-          if (siteRows && siteRows.length > 0) {
-            panelName = siteRows[0].Panel_Make || '';
-            siteId = siteRows[0].SN || 0;
-          }
-        } catch (err) { /* ignore */ }
+          const [siteRows] = await pool.query("SELECT Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1", [currentAccount]);
+          if (siteRows && siteRows.length > 0) panelName = siteRows[0].Panel_Make || 'SECURICO';
+        } catch (err) { }
 
-        let columns = ['panelid', 'udate', 'ip'];
-        let placeholders = ['?', '?', '?'];
-        let values = [currentAccount, receivedtime, remoteIp || ''];
-        let setQueryArr = ['udate = ?', 'ip = ?'];
-        let setValues = [receivedtime, remoteIp || ''];
-
-        if (panelName) {
-          columns.push('panelName');
-          placeholders.push('?');
-          values.push(panelName);
-          setQueryArr.push('panelName = ?');
-          setValues.push(panelName);
-        }
+        let columns = ['panelid', 'udate', 'ip', 'panelName'];
+        let placeholders = ['?', '?', '?', '?'];
+        let values = [currentAccount, receivedtime, remoteIp || '', panelName];
+        let setQueryArr = ['udate = ?', 'ip = ?', 'panelName = ?'];
+        let setValues = [receivedtime, remoteIp || '', panelName];
 
         decoded.relayList.forEach(r => {
           if (r.relayId >= 1 && r.relayId <= 20) {
             const colName = `relay${r.relayId}`;
+            const stVal = (r.status === '1' || r.status === 1 || r.status === 'ON') ? '1' : '0';
             columns.push(colName);
             placeholders.push('?');
-            values.push(r.status);
+            values.push(stVal);
             setQueryArr.push(`${colName} = ?`);
-            setValues.push(r.status);
+            setValues.push(stVal);
           }
         });
 
@@ -323,71 +235,49 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
         if (rows && rows.length > 0) {
           const updateQuery = `UPDATE panel_health SET ${setQueryArr.join(', ')} WHERE panelid = ?`;
           await pool.query(updateQuery, [...setValues, currentAccount]);
-          console.log(`✅ [SECURICO] Relay status (with IP/Name) UPDATED in panel_health for Panel #${currentAccount}`);
+          console.log(`✅ [SECURICO] Relay status UPDATED in panel_health for Panel #${currentAccount}`);
         } else {
           const insertQuery = `INSERT INTO panel_health (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
-          console.log(`[DEBUG] Query:`, insertQuery);
-          console.log(`[DEBUG] Values length:`, values.length, values);
           await pool.query(insertQuery, values);
-          console.log(`✅ [SECURICO] Relay status (with IP/Name) INSERTED into panel_health for Panel #${currentAccount}`);
+          console.log(`✅ [SECURICO] Relay status INSERTED into panel_health for Panel #${currentAccount}`);
         }
+
+        healthEvents.emit('health_saved', {
+          account: currentAccount,
+          make: panelName,
+          type: 'relay',
+          count: decoded.relayList.length,
+          timestamp: receivedtime
+        });
       } catch (dbErr) {
         console.error(`❌ [SECURICO] DB Error saving relay status to panel_health:`, dbErr.message);
       }
-    } else if (decoded.code) {
-      const seqno = header ? header.sequence : '0000';
-      const alarmCode = decoded.code;
-      const receivedtime = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-      let priority = 'N', level = 0, targetTable = 'alerts';
-      const configsArray = panelConfigCache.get('SECURICO');
-
-      if (configsArray) {
-        let matchedConfig = null;
-        for (const config of configsArray) {
-          if (config.alarmCodeArr.includes(alarmCode)) {
-            matchedConfig = config;
-            break;
-          }
-        }
-
-        if (matchedConfig) {
-          if (matchedConfig.destination === 'back') {
-            targetTable = 'backalerts';
-          } else if (matchedConfig.destination === 'front') {
-            targetTable = 'alerts';
-            if (matchedConfig.level1Arr.includes(alarmCode)) { level = 1; priority = 'Y'; }
-            else if (matchedConfig.level2Arr.includes(alarmCode)) { level = 2; priority = 'Y'; }
-            else if (matchedConfig.level3Arr.includes(alarmCode)) { level = 3; priority = 'Y'; }
-            else { level = 0; priority = matchedConfig.rowPriority; }
-          }
-        }
-      }
-
-      const baseValues = [
-        currentAccount, seqno, decoded.zone || '000', alarmCode,
-        decoded.formattedDate || receivedtime, decoded.event || ''
-      ];
-
-      try {
-        await pool.query(`INSERT INTO alerts_copy (panelid, seqno, zone, alarm, createtime, alerttype, status) VALUES (?, ?, ?, ?, ?, ?,'O')`, baseValues);
-      } catch (err) { }
-
-      try {
-        await pool.query(`INSERT INTO ${targetTable} (panelid, seqno, zone, alarm, createtime, alerttype, status, priority, level) VALUES (?, ?, ?, ?, ?, ?, 'O', ?, ?)`, [...baseValues, priority, level]);
-        console.log(`✅ [SECURICO] Data successfully saved to ${targetTable} (Alarm: ${alarmCode})`);
-      } catch (err) {
-        console.error(`❌ DB Error (${targetTable}):`, err.message);
-      }
     }
 
-    eventLog.unshift({
-      ...decoded,
-      raw: message,
-      crcValid: crcOK,
-      receivedAt: new Date().toISOString()
-    });
+    eventLog.unshift({ ...decoded, raw: message, receivedAt: new Date().toISOString() });
     if (eventLog.length > MAX_LOG) eventLog.pop();
+
+    if (header && !socket.destroyed) {
+      let commandSentFromQueue = false;
+      if (currentAccount) {
+        const queue = commandQueue.get(currentAccount);
+        if (queue && queue.length > 0) {
+          const pending = [...queue];
+          commandQueue.set(currentAccount, []);
+          for (const item of pending) {
+            const success = sendCommandToPanel(socket, item.command, currentAccount, item.zone || '000');
+            if (success) {
+              commandSentFromQueue = true;
+              if (item.resolve) item.resolve({ sent: true, command: item.command, zone: item.zone || '000' });
+            }
+          }
+        }
+      }
+      if (!commandSentFromQueue && !message.includes('"ACK"')) {
+        const ackMsg = buildACK(header);
+        if (ackMsg) socket.write(ackMsg);
+      }
+    }
   });
 
   socket.on("end", () => { if (currentAccount) activeSockets.delete(currentAccount); });
@@ -398,40 +288,27 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
 async function processRpsDb(decoded, currentAccount, remoteIp) {
   try {
     const receivedtime = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-    let panelName = '';
-    let siteId = 0;
+    let panelName = 'SECURICO';
     try {
-      const [siteRows] = await pool.query("SELECT SN, Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1", [currentAccount]);
-      if (siteRows && siteRows.length > 0) {
-        panelName = siteRows[0].Panel_Make || '';
-        siteId = siteRows[0].SN || 0;
-      }
-    } catch (err) { /* ignore */ }
+      const [siteRows] = await pool.query("SELECT Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1", [currentAccount]);
+      if (siteRows && siteRows.length > 0) panelName = siteRows[0].Panel_Make || 'SECURICO';
+    } catch (err) { }
 
-    let columns = ['panelid', 'udate', 'ip'];
-    let placeholders = ['?', '?', '?'];
-    let values = [currentAccount, receivedtime, remoteIp || ''];
-    let setQueryArr = ['udate = ?', 'ip = ?'];
-    let setValues = [receivedtime, remoteIp || ''];
-
-    if (panelName) {
-      columns.push('panelName');
-      placeholders.push('?');
-      values.push(panelName);
-      setQueryArr.push('panelName = ?');
-      setValues.push(panelName);
-    }
+    let columns = ['panelid', 'udate', 'ip', 'panelName'];
+    let placeholders = ['?', '?', '?', '?'];
+    let values = [currentAccount, receivedtime, remoteIp || '', panelName];
+    let setQueryArr = ['udate = ?', 'ip = ?', 'panelName = ?'];
+    let setValues = [receivedtime, remoteIp || '', panelName];
 
     decoded.zonesList.forEach(z => {
       if (z.zone >= 1 && z.zone <= 60) {
         const colName = `zon${z.zone}`;
-        const finalStatus = z.statusDescription || z.status;
+        const stVal = z.statusDescription || z.status || '0';
         columns.push(colName);
         placeholders.push('?');
-        values.push(finalStatus);
+        values.push(stVal);
         setQueryArr.push(`${colName} = ?`);
-        setValues.push(finalStatus);
+        setValues.push(stVal);
       }
     });
 
@@ -439,70 +316,60 @@ async function processRpsDb(decoded, currentAccount, remoteIp) {
     if (rows && rows.length > 0) {
       const updateQuery = `UPDATE panel_health SET ${setQueryArr.join(', ')} WHERE panelid = ?`;
       await pool.query(updateQuery, [...setValues, currentAccount]);
-      console.log(`✅ [SECURICO] Zone status (with IP/Name) UPDATED in panel_health for Panel #${currentAccount}`);
+      console.log(`✅ [SECURICO] Zone status (${decoded.zonesList.length} zones) UPDATED in panel_health for Panel #${currentAccount}`);
     } else {
-        const insertQuery = `INSERT INTO panel_health (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
-        console.log(`[DEBUG] Query:`, insertQuery);
-        console.log(`[DEBUG] Values length:`, values.length, values);
-        await pool.query(insertQuery, values);
-        console.log(`✅ [SECURICO] Zone status (with IP/Name) INSERTED into panel_health for Panel #${currentAccount}`);
+      const insertQuery = `INSERT INTO panel_health (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
+      await pool.query(insertQuery, values);
+      console.log(`✅ [SECURICO] Zone status (${decoded.zonesList.length} zones) INSERTED into panel_health for Panel #${currentAccount}`);
     }
+
+    healthEvents.emit('health_saved', {
+      account: currentAccount,
+      make: panelName,
+      type: 'zone',
+      count: decoded.zonesList.length,
+      timestamp: receivedtime
+    });
   } catch (dbErr) {
     console.error(`❌ [SECURICO] DB Error saving zone status to panel_health:`, dbErr.message);
   }
 }
 
 async function mergeAndPushRPS(account, buffer, crcOK, remoteIp) {
-  let allZones = [];
-  buffer.parts.forEach(p => {
-    allZones = allZones.concat(p.zonesList || []);
-  });
-  // Sort zones to ensure correct ordering (1 to 47)
-  allZones.sort((a, b) => a.zone - b.zone);
+  let combinedZones = [];
+  const sortedParts = buffer.parts.sort((a, b) => (a.zonesList[0]?.zone || 0) - (b.zonesList[0]?.zone || 0));
+  sortedParts.forEach(p => { combinedZones = combinedZones.concat(p.zonesList); });
 
-  const merged = { ...buffer.parts[0] };
-  merged.event = "Zone Status Response";
-  merged.zonesList = allZones;
-  merged.raw = buffer.rawMessages.join(" || ");
+  const mergedDecoded = {
+    account: account,
+    code: "RPS_RES",
+    event: `Full Zone Status Response (${combinedZones.length} Zones)`,
+    zonesList: combinedZones,
+    timestamp: sortedParts[0]?.timestamp || null,
+    formattedDate: sortedParts[0]?.formattedDate || null
+  };
 
-  // Push to eventLog
-  eventLog.unshift({
-    ...merged,
-    crcValid: crcOK,
-    receivedAt: new Date().toISOString()
-  });
-  if (eventLog.length > MAX_LOG) eventLog.pop();
-
-  // Process DB update
-  await processRpsDb(merged, account, remoteIp);
-  console.log(`✅ [SECURICO] Buffered RPS merged and logged for Panel #${account} with ${allZones.length} zones.`);
+  await processRpsDb(mergedDecoded, account, remoteIp);
 }
 
 function initiatePanelConnection(panelId, ip) {
-  const OUTGOING_PORT = 5000;
-  console.log(`\n⏳ [SECURICO] Attempting OUTGOING connection to Panel #${panelId} at IP: ${ip}:${OUTGOING_PORT}...`);
+  console.log(`\n⏳ [SECURICO] Attempting OUTGOING connection to Panel #${panelId} at IP: ${ip}:${TCP_PORT}...`);
   const socket = new net.Socket();
 
-  socket.connect(OUTGOING_PORT, ip, () => {
+  socket.connect(TCP_PORT, ip, () => {
     console.log(`✅ [SECURICO] Successfully connected to Panel #${panelId} (${ip})`);
     activeSockets.set(panelId, socket);
     handleSocketEvents(socket, ip, panelId);
 
-    // Check and process pending commands with a short delay to allow panel readiness
-    setTimeout(() => {
-      if (socket.destroyed) return;
-      const queue = commandQueue.get(panelId);
-      if (queue && queue.length > 0) {
-        const pending = [...queue];
-        commandQueue.set(panelId, []);
-        for (const item of pending) {
-          const success = sendCommandToPanel(socket, item.command, panelId, item.zone || '000');
-          if (item.resolve) {
-            item.resolve({ sent: success, command: item.command, zone: item.zone || '000', sentAt: new Date().toISOString() });
-          }
-        }
+    const queue = commandQueue.get(panelId);
+    if (queue && queue.length > 0) {
+      const pending = [...queue];
+      commandQueue.set(panelId, []);
+      for (const item of pending) {
+        const success = sendCommandToPanel(socket, item.command, panelId, item.zone || '000');
+        if (item.resolve) item.resolve({ sent: success, command: item.command, zone: item.zone || '000' });
       }
-    }, 1500); // 1.5 second delay
+    }
   });
 
   socket.on("error", (err) => {
@@ -510,118 +377,12 @@ function initiatePanelConnection(panelId, ip) {
   });
 
   socket.on("close", () => {
-    console.log(`⚠️ [SECURICO] Connection closed for Panel #${panelId} (${ip}). Retrying in 1 minute...`);
-    setTimeout(() => {
-      if (!activeSockets.has(panelId) || activeSockets.get(panelId).destroyed) {
-        initiatePanelConnection(panelId, ip);
-      }
-    }, 60000); // 1 minute
+    activeSockets.delete(panelId);
   });
-}
-
-let healthLoopStarted = false;
-
-function querySinglePanelHealth(panelId, ip, currentIndex, totalPanels) {
-  return new Promise((resolve) => {
-    console.log(`\n--------------------------------------------------`);
-    console.log(`⏳ [SECURICO] [${currentIndex}/${totalPanels}] Fetched Panel #${panelId} (IP: ${ip}) from 'sites' table.`);
-
-    const existingSocket = activeSockets.get(panelId);
-    if (existingSocket && !existingSocket.destroyed) {
-      console.log(`✅ [SECURICO] Panel #${panelId} is ONLINE (Active Connection). Sending Zone & Relay queries...`);
-      sendCommandToPanel(existingSocket, 'READ_PORT_STATUS_1', panelId, '000');
-      setTimeout(() => {
-        if (!existingSocket.destroyed) sendCommandToPanel(existingSocket, 'READ_RELAY_STATUS', panelId, '000');
-      }, 1500);
-      console.log(`--------------------------------------------------`);
-      return resolve();
-    }
-
-    const OUTGOING_PORT = 5000;
-    console.log(`📡 [SECURICO] Connecting to Panel #${panelId} at IP: ${ip}:${OUTGOING_PORT}...`);
-    const socket = new net.Socket();
-    let completed = false;
-
-    const finish = (reason) => {
-      if (!completed) {
-        completed = true;
-        try { socket.destroy(); } catch (e) {}
-        activeSockets.delete(panelId);
-        console.log(`🏁 [SECURICO] Panel #${panelId} -> ${reason}`);
-        console.log(`--------------------------------------------------`);
-        resolve();
-      }
-    };
-
-    const timer = setTimeout(() => finish("❌ Offline (Connection Timeout) - Skipping DB Insert"), 4000);
-
-    socket.connect(OUTGOING_PORT, ip, () => {
-      clearTimeout(timer);
-      console.log(`✅ [SECURICO] Successfully Connected to Panel #${panelId} (${ip})!`);
-      activeSockets.set(panelId, socket);
-      handleSocketEvents(socket, ip, panelId);
-
-      setTimeout(() => {
-        if (!socket.destroyed) {
-          console.log(`📤 [SECURICO] Querying Zone Status & Relay Status for Panel #${panelId}...`);
-          sendCommandToPanel(socket, 'READ_PORT_STATUS_1', panelId, '000');
-          setTimeout(() => {
-            if (!socket.destroyed) sendCommandToPanel(socket, 'READ_RELAY_STATUS', panelId, '000');
-            setTimeout(() => finish("Done"), 2000);
-          }, 1500);
-        } else {
-          finish("Done");
-        }
-      }, 1000);
-    });
-
-    socket.on("error", (err) => {
-      clearTimeout(timer);
-      finish(`❌ Offline (${err.code || err.message}) - Skipping DB Insert`);
-    });
-
-    socket.on("close", () => {
-      clearTimeout(timer);
-      finish("Connection Closed");
-    });
-  });
-}
-
-async function startPanelHealthLoop() {
-  if (healthLoopStarted) return;
-  healthLoopStarted = true;
-  console.log("\n🔄 [SECURICO] Starting Continuous Sequential Panel Health Polling Loop...");
-
-  while (true) {
-    try {
-      const [rows] = await pool.query(
-        "SELECT NewPanelID, dvrip FROM sites WHERE Panel_Make LIKE '%securico%' AND dvrip IS NOT NULL AND dvrip != '' AND TRIM(dvrip) != ''"
-      );
-
-      if (rows && rows.length > 0) {
-        console.log(`\n📋 [SECURICO LOOP] Loaded ${rows.length} SECURICO panel(s) from 'sites' table. Processing one by one...`);
-        for (let i = 0; i < rows.length; i++) {
-          const panelId = String(rows[i].NewPanelID).trim();
-          const ip = String(rows[i].dvrip).trim();
-
-          await querySinglePanelHealth(panelId, ip, i + 1, rows.length);
-          await new Promise(r => setTimeout(r, 1000));
-        }
-      } else {
-        console.log(`ℹ️ [SECURICO LOOP] No active SECURICO panels found in 'sites' table. Waiting 10s...`);
-        await new Promise(r => setTimeout(r, 10000));
-      }
-    } catch (err) {
-      console.error(`❌ [SECURICO LOOP] Error during loop execution:`, err.message);
-      await new Promise(r => setTimeout(r, 5000));
-    }
-  }
 }
 
 function startServer(customPort) {
   const port = customPort || TCP_PORT;
-  startPanelHealthLoop();
-
   const tcpServer = net.createServer((socket) => {
     const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^.*:/, '').trim() : null;
     console.log(`\n📡 [SECURICO] Device TCP Connection Initiated from IP: ${remoteIp}`);
@@ -629,96 +390,93 @@ function startServer(customPort) {
   });
 
   tcpServer.listen(port, () => {
-    console.log(`🚀 SECURICO TCP Server listening for devices on port ${port}`);
+    console.log(`📡 SECURICO Protocol Manager listening on TCP Port ${port}`);
   });
+
+  return tcpServer;
 }
 
-// ==========================================
-// 2. API Handlers
-// ==========================================
-function checkConnection(account, maxWait = 60000) {
+function queueCommand(account, command, zone = "000", waitMs = 60000) {
   return new Promise((resolve) => {
-    const sock = activeSockets.get(account);
-    if (sock && !sock.destroyed) {
-      return resolve({ success: true, status: "online" });
+    const socket = activeSockets.get(account);
+    if (socket && !socket.destroyed) {
+      const success = sendCommandToPanel(socket, command, account, zone);
+      return resolve({ success, status: success ? 'sent' : 'send_failed', account, command });
     }
-    if (!connectWaiters.has(account)) connectWaiters.set(account, []);
-    let done = false;
-    connectWaiters.get(account).push(() => {
-      if (!done) { done = true; resolve({ success: true, status: "online" }); }
-    });
+
+    if (!commandQueue.has(account)) commandQueue.set(account, []);
+    const queue = commandQueue.get(account);
+    const item = { command, zone, resolve, queuedAt: Date.now() };
+    queue.push(item);
+
     setTimeout(() => {
-      if (!done) { done = true; resolve({ success: false, status: "timeout" }); }
-    }, maxWait);
+      const currentQ = commandQueue.get(account) || [];
+      const idx = currentQ.indexOf(item);
+      if (idx !== -1) {
+        currentQ.splice(idx, 1);
+        resolve({ success: false, status: 'timeout', account, command });
+      }
+    }, waitMs);
   });
 }
 
-function queueCommand(account, command, zone, maxWait = 60000) {
+function checkConnection(account, waitMs = 100) {
   return new Promise((resolve) => {
-    const sock = activeSockets.get(account);
-    const timeBefore = new Date().toISOString();
-    if (sock && !sock.destroyed) {
-      const success = sendCommandToPanel(sock, command, account, zone);
-      // Wait 5000ms to allow multi-part commands like READ_PORT_STATUS to complete
-      setTimeout(() => {
-        const newEvents = eventLog.filter(e => e.account === account && e.receivedAt > timeBefore);
-        resolve({ success, status: "sent_immediately", panelResponse: newEvents, responseCount: newEvents.length });
-      }, 5000);
-    } else {
-      if (!commandQueue.has(account)) commandQueue.set(account, []);
-      let done = false;
-      commandQueue.get(account).push({
-        command, zone, queuedAt: timeBefore,
-        resolve: (res) => {
-          if (!done) {
-            done = true;
-            setTimeout(() => {
-              const newEvents = eventLog.filter(e => e.account === account && e.receivedAt > (res.sentAt || timeBefore));
-              resolve({ success: res.sent, status: "sent_from_queue", panelResponse: newEvents, responseCount: newEvents.length });
-            }, 5000);
-          }
-        }
-      });
-
-      // Attempt on-demand connection if not already connected
-      pool.query("SELECT dvrip FROM sites WHERE NewPanelID = ? AND dvrip IS NOT NULL AND dvrip != '' LIMIT 1", [account])
-        .then(([rows]) => {
-          if (rows && rows.length > 0) {
-            const ip = String(rows[0].dvrip).trim();
-            console.log(`\n🔄 [SECURICO] On-Demand connection triggered for Panel #${account} (IP: ${ip})`);
-            initiatePanelConnection(account, ip);
-          } else {
-            console.log(`\n⚠️ [SECURICO] Cannot connect on-demand to Panel #${account}: No valid IP found in DB.`);
-          }
-        })
-        .catch(err => console.error(`\n❌ [SECURICO] DB Error while fetching IP for on-demand connection:`, err.message));
-
-      setTimeout(() => {
-        if (!done) {
-          done = true;
-          resolve({ success: false, status: "timeout", message: "Panel did not connect" });
-        }
-      }, maxWait);
+    const socket = activeSockets.get(account);
+    if (socket && !socket.destroyed) {
+      return resolve({ success: true, status: 'connected', account });
     }
+    if (waitMs <= 0) return resolve({ success: false, status: 'disconnected', account });
+
+    if (!connectWaiters.has(account)) connectWaiters.set(account, []);
+    const waiters = connectWaiters.get(account);
+    let resolved = false;
+
+    const onConnect = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve({ success: true, status: 'connected', account });
+      }
+    };
+    waiters.push(onConnect);
+
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = waiters.indexOf(onConnect);
+        if (idx !== -1) waiters.splice(idx, 1);
+        resolve({ success: false, status: 'disconnected', account });
+      }
+    }, waitMs);
   });
 }
 
-function getEvents(account, limit) {
-  let events = account ? eventLog.filter(e => e.account === account) : eventLog;
-  if (limit > 0) events = events.slice(0, limit);
-  return { success: true, count: events.length, events };
+function getEvents(account, lastIndex = 0) {
+  let evts = account ? eventLog.filter(e => e.account === account) : eventLog;
+  if (lastIndex > 0 && lastIndex < evts.length) {
+    evts = evts.slice(0, lastIndex);
+  }
+  return { success: true, count: evts.length, events: evts };
 }
 
 function getStatus() {
   const devices = [];
-  activeSockets.forEach((sock, acct) => { devices.push({ account: acct, connected: !sock.destroyed }); });
+  for (const [account, socket] of activeSockets.entries()) {
+    devices.push({
+      account,
+      connected: socket && !socket.destroyed,
+      remoteAddress: socket.remoteAddress,
+      remotePort: socket.remotePort
+    });
+  }
   return { success: true, devices };
 }
 
 module.exports = {
   startServer,
-  checkConnection,
   queueCommand,
+  checkConnection,
   getEvents,
-  getStatus
+  getStatus,
+  initiatePanelConnection
 };

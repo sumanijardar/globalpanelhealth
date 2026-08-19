@@ -10,6 +10,15 @@
     "queueLimit": 0
   },
   "api_port": 3000,
+  "health_check": {
+    "enabled": true,
+    "check_zone_status": true,
+    "check_relay_status": true,
+    "panel_timeout_seconds": 15,
+    "delay_between_panels_ms": 1000,
+    "cycle_interval_seconds": 10,
+    "panel_make_filter": "ALL"
+  },
   "protocols": {
     "mayur": {
       "enabled": true,

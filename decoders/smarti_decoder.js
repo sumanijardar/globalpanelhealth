@@ -371,6 +371,62 @@ function decodeSIA(message) {
         }
     }
 
+    // 3. Extract second bracket content for Handshakes or Status reports
+    const secondBracketMatch = message.match(/\]\s*\[(N\|.*?)\]/);
+    if (secondBracketMatch) {
+        const secContent = secondBracketMatch[1];
+        const secParts = secContent.split("|");
+
+        if (secParts[0] === 'N') {
+            // NYY004 (Read Commands Response)
+            if (result.zone === '004' && secParts.length > 1) {
+                const cmdType = secParts[1];
+                if (cmdType === '003' && secParts.length >= 4) {
+                    const z = secParts[2];
+                    const st = secParts[3];
+                    let stDesc = "Unknown";
+                    if (st === 'U') stDesc = "Uninstalled";
+                    else if (st === 'R') stDesc = "Restored/Normal";
+                    else if (st === 'B') stDesc = "Bypassed";
+                    else if (st === 'A') stDesc = "Alarm";
+                    result.event = `Read Command Response: Zone ${z} Status - ${stDesc}`;
+                    result.sensors = [{ zone: z, status: st, description: stDesc }];
+                } else if (cmdType === '005' && secParts.length >= 4) {
+                    const outNo = secParts[2];
+                    const outSt = secParts[3] === '1' ? 'ON' : 'OFF';
+                    result.event = `Read Command Response: Output ${outNo} Status - ${outSt}`;
+                    result.outputNo = outNo;
+                    result.outputState = outSt;
+                }
+            }
+            // NYY040 or NYY041 (Sensor status grids)
+            else if ((result.zone === '040' || result.zone === '041') && secParts.length > 1) {
+                const sensors = [];
+                for (let i = 1; i < secParts.length; i++) {
+                    const item = secParts[i];
+                    if (item.length >= 4) {
+                        const zoneNo = item.substring(0, 3);
+                        const statusChar = item.substring(3);
+
+                        let statusDesc = "Unknown";
+                        if (statusChar === 'B') statusDesc = "Bypassed";
+                        else if (statusChar === 'R') statusDesc = "Normal/Restored";
+                        else if (statusChar === 'U') statusDesc = "Uninstalled";
+                        else if (statusChar === 'A') statusDesc = "Alarm";
+
+                        sensors.push({
+                            zone: zoneNo,
+                            status: statusChar,
+                            description: statusDesc
+                        });
+                    }
+                }
+                result.sensors = sensors;
+                result.zonesList = sensors;
+            }
+        }
+    }
+
     return result;
 }
 

@@ -10,8 +10,7 @@ const smartiProtocol = require("./protocols/smarti");
 const raxProtocol = require("./protocols/rax");
 const securicoProtocol = require("./protocols/securico");
 const intellitechProtocol = require("./protocols/intellitech");
-const fs = require("fs");
-const path = require("path");
+const { startHealthPoller } = require("./services/health_poller");
 
 // Load master configuration
 const appConfig = loadConfig();
@@ -69,6 +68,13 @@ if (appConfig.protocols.intellitech && appConfig.protocols.intellitech.enabled) 
   console.log("⏸️ INTELLITECH Protocol is DISABLED (Check config.json)");
 }
 
+// Start continuous sequential health polling engine
+if (appConfig.health_check && appConfig.health_check.enabled) {
+  startHealthPoller(appConfig);
+} else {
+  console.log("⏸️ Global Health Poller is DISABLED in config.json");
+}
+
 // ============================================================================
 // 🌐 UNIVERSAL HTTP API SERVER
 // ============================================================================
@@ -90,24 +96,14 @@ const apiServer = http.createServer(async (req, res) => {
       let panelMake = null;
       let handler = null;
 
-      // COMMENTED OUT FOR TESTING: sirif sites table use karna hai
-      /*
       let [rows] = await pool.query(
-        "SELECT Panel_Make FROM sites_zicom WHERE NewPanelID = ? LIMIT 1",
-        [account]
-      );
-      */
-
-      // Sirf sites se fetch kar rahe hain for now
-      let [rows] = await pool.query(
-        "SELECT Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1",
-        [account]
+        "SELECT Panel_Make FROM sites WHERE NewPanelID = ? OR PanelID = ? LIMIT 1",
+        [account, account]
       );
 
       if (rows.length > 0) {
         panelMake = (rows[0].Panel_Make || "").toString().trim().toUpperCase();
       } else {
-        // Fallback: Check if panel is actively connected OR has recently sent events
         const mayurDevices = mayurProtocol.getStatus().devices;
         const rassDevices = rassProtocol.getStatus().devices;
         const smartiDevices = smartiProtocol.getStatus().devices;
@@ -137,7 +133,7 @@ const apiServer = http.createServer(async (req, res) => {
 
       if (panelMake === 'MAYUR') handler = mayurProtocol;
       else if (panelMake === 'RASS') handler = rassProtocol;
-      else if (panelMake.includes('SMART') || panelMake.includes('SMAERT')) handler = smartiProtocol;
+      else if (panelMake.includes('SMART') || panelMake.includes('SMAERT') || panelMake.includes('ZICOM')) handler = smartiProtocol;
       else if (panelMake === 'RAX' || panelMake === 'REX') handler = raxProtocol;
       else if (panelMake.includes('SECURICO')) handler = securicoProtocol;
       else if (panelMake.includes('INTELLITECH') || panelMake.includes('GOLDBOX')) handler = intellitechProtocol;
@@ -176,6 +172,34 @@ const apiServer = http.createServer(async (req, res) => {
     });
   }
 
+  // --- /api/zone_status ---
+  else if (parsedUrl.pathname === '/api/zone_status' && req.method === 'GET') {
+    const account = parsedUrl.searchParams.get('account');
+    const wait = parseInt(parsedUrl.searchParams.get('wait') || '15') * 1000;
+    await handleRequest(account, async (handler, make) => {
+      let cmd = 'READ_ZONE_STATUS';
+      if (make === 'RASS') cmd = 'READ_PORT_STATUS_1';
+      else if (make === 'SECURICO' || make === 'RAX') cmd = 'READ_PORT_STATUS';
+      else if (make.includes('SMART')) cmd = 'STATUS';
+
+      const result = await handler.queueCommand(account, cmd, '000', wait);
+      res.writeHead(result.success ? 200 : 500);
+      res.end(JSON.stringify({ ...result, panelMake: make, commandSent: cmd }));
+    });
+  }
+
+  // --- /api/relay_status ---
+  else if (parsedUrl.pathname === '/api/relay_status' && req.method === 'GET') {
+    const account = parsedUrl.searchParams.get('account');
+    const zone = parsedUrl.searchParams.get('zone') || '000';
+    const wait = parseInt(parsedUrl.searchParams.get('wait') || '15') * 1000;
+    await handleRequest(account, async (handler, make) => {
+      const result = await handler.queueCommand(account, 'READ_RELAY_STATUS', zone, wait);
+      res.writeHead(result.success ? 200 : 500);
+      res.end(JSON.stringify({ ...result, panelMake: make, commandSent: 'READ_RELAY_STATUS' }));
+    });
+  }
+
   // --- /api/command ---
   else if (parsedUrl.pathname === '/api/command' && req.method === 'GET') {
     const account = parsedUrl.searchParams.get('account');
@@ -208,7 +232,6 @@ const apiServer = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ...result, panelMake: make }));
       });
     } else {
-      // If no account specified, combine events from both
       const mayurEvts = mayurProtocol.getEvents(null, last).events;
       const rassEvts = rassProtocol.getEvents(null, last).events;
       const smartiEvts = smartiProtocol.getEvents(null, last).events;
@@ -216,7 +239,11 @@ const apiServer = http.createServer(async (req, res) => {
       const securicoEvts = securicoProtocol.getEvents(null, last).events;
       const intellitechEvts = intellitechProtocol.getEvents(null, last).events;
       res.writeHead(200);
-      res.end(JSON.stringify({ success: true, count: mayurEvts.length + rassEvts.length + smartiEvts.length + raxEvts.length + securicoEvts.length + intellitechEvts.length, mayurEvents: mayurEvts, rassEvents: rassEvts, smartiEvents: smartiEvts, raxEvents: raxEvts, securicoEvents: securicoEvts, intellitechEvents: intellitechEvts }));
+      res.end(JSON.stringify({
+        success: true,
+        count: mayurEvts.length + rassEvts.length + smartiEvts.length + raxEvts.length + securicoEvts.length + intellitechEvts.length,
+        events: [...rassEvts, ...securicoEvts, ...raxEvts, ...smartiEvts, ...mayurEvts, ...intellitechEvts]
+      }));
     }
   }
 
@@ -229,16 +256,34 @@ const apiServer = http.createServer(async (req, res) => {
     const securicoStatus = securicoProtocol.getStatus().devices;
     const intellitechStatus = intellitechProtocol.getStatus().devices;
     res.writeHead(200);
-    res.end(JSON.stringify({ success: true, mayur: mayurStatus, rass: rassStatus, smarti: smartiStatus, rax: raxStatus, securico: securicoStatus, intellitech: intellitechStatus }));
+    res.end(JSON.stringify({
+      success: true,
+      mayur: mayurStatus,
+      rass: rassStatus,
+      smarti: smartiStatus,
+      rax: raxStatus,
+      securico: securicoStatus,
+      intellitech: intellitechStatus
+    }));
+  }
+
+  // --- /api/health_config ---
+  else if (parsedUrl.pathname === '/api/health_config' && req.method === 'GET') {
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      success: true,
+      health_check: appConfig.health_check
+    }));
   }
 
   else {
     res.writeHead(404);
-    res.end(JSON.stringify({ error: "Route not found. Supported routes: /api/check, /api/connect, /api/command, /api/events, /api/status" }));
+    res.end(JSON.stringify({ error: "Route not found. Supported routes: /api/check, /api/connect, /api/zone_status, /api/relay_status, /api/command, /api/events, /api/status, /api/health_config" }));
   }
 });
 
 apiServer.listen(API_PORT, () => {
-  console.log(`\n🚀 Universal API Server running on port ${API_PORT}`);
-  console.log(`🌐 Test URL: http://localhost:${API_PORT}/api/command?account=040037&command=ARM&zone=000`);
+  console.log(`\n🚀 Universal Panel Health Server running on port ${API_PORT}`);
+  console.log(`🌐 Test Zone Status API : http://localhost:${API_PORT}/api/zone_status?account=040037`);
+  console.log(`🌐 Test Relay Status API: http://localhost:${API_PORT}/api/relay_status?account=040037`);
 });

@@ -13,6 +13,15 @@ const defaultConfig = {
     queueLimit: 0
   },
   api_port: 3000,
+  health_check: {
+    enabled: true,
+    check_zone_status: true,
+    check_relay_status: true,
+    panel_timeout_seconds: 15,
+    delay_between_panels_ms: 1000,
+    cycle_interval_seconds: 10,
+    panel_make_filter: "ALL"
+  },
   protocols: {
     mayur: { enabled: true, port: 9999 },
     rass: { enabled: true, port: 6550 },
@@ -32,7 +41,6 @@ function loadConfig() {
       const fileData = fs.readFileSync(configPath, 'utf8');
       const parsedConfig = JSON.parse(fileData);
       
-      // Deep merge with defaultConfig to ensure all properties exist
       config = {
         ...defaultConfig,
         ...parsedConfig,
@@ -40,13 +48,16 @@ function loadConfig() {
           ...defaultConfig.database,
           ...(parsedConfig.database || {})
         },
+        health_check: {
+          ...defaultConfig.health_check,
+          ...(parsedConfig.health_check || {})
+        },
         protocols: {
           ...defaultConfig.protocols,
           ...(parsedConfig.protocols || {})
         }
       };
       
-      // Ensure sub-protocol objects have defaults
       for (const key of Object.keys(defaultConfig.protocols)) {
         config.protocols[key] = {
           ...defaultConfig.protocols[key],
@@ -56,29 +67,6 @@ function loadConfig() {
 
       console.log(`✅ Loaded main configuration from config.json`);
     } else {
-      // Legacy fallbacks check if config.json does not exist
-      const legacyDbPath = path.join(process.cwd(), 'db_config.json');
-      if (fs.existsSync(legacyDbPath)) {
-        try {
-          const dbData = JSON.parse(fs.readFileSync(legacyDbPath, 'utf8'));
-          config.database = { ...config.database, ...dbData };
-        } catch (e) {}
-      }
-
-      const legacyServerPath = path.join(process.cwd(), 'server_config.json');
-      if (fs.existsSync(legacyServerPath)) {
-        try {
-          const srvData = JSON.parse(fs.readFileSync(legacyServerPath, 'utf8'));
-          if (srvData.RUN_MAYUR !== undefined) config.protocols.mayur.enabled = srvData.RUN_MAYUR;
-          if (srvData.RUN_RASS !== undefined) config.protocols.rass.enabled = srvData.RUN_RASS;
-          if (srvData.RUN_SMARTI !== undefined) config.protocols.smarti.enabled = srvData.RUN_SMARTI;
-          if (srvData.RUN_RAX !== undefined) config.protocols.rax.enabled = srvData.RUN_RAX;
-          if (srvData.RUN_SECURICO !== undefined) config.protocols.securico.enabled = srvData.RUN_SECURICO;
-          if (srvData.RUN_INTELLITECH !== undefined) config.protocols.intellitech.enabled = srvData.RUN_INTELLITECH;
-        } catch (e) {}
-      }
-
-      // Save initial unified config.json
       fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
       console.log(`ℹ️ Created default config.json template at ${configPath}`);
     }
