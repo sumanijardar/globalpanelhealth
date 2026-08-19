@@ -167,7 +167,7 @@ function decodeSIA(message) {
                     const st = secParts[3];
                     let stDesc = "Unknown";
                     if (st === 'U') stDesc = "Uninstalled";
-                    else if (st === 'R') stDesc = "Restored/Normal";
+                    else if (st === 'R') stDesc = "Restored";
                     else if (st === 'B') stDesc = "Bypassed";
                     else if (st === 'A') stDesc = "Alarm";
                     result.event = `Read Command Response: Zone ${z} Status - ${stDesc}`;
@@ -207,7 +207,7 @@ function decodeSIA(message) {
 
                         let statusDesc = "Unknown";
                         if (statusChar === 'B') statusDesc = "Bypassed";
-                        else if (statusChar === 'R') statusDesc = "Normal/Restored";
+                        else if (statusChar === 'R') statusDesc = "Restored";
                         else if (statusChar === 'U') statusDesc = "Uninstalled";
                         else if (statusChar === 'A') statusDesc = "Alarm";
 
