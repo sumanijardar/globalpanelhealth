@@ -165,13 +165,31 @@ function decodeSIA(message) {
                 } else if (cmdType === '003' && secParts.length >= 4) {
                     const z = secParts[2];
                     const st = secParts[3];
+                    /*
                     let stDesc = "Unknown";
                     if (st === 'U') stDesc = "Uninstalled";
                     else if (st === 'R') stDesc = "Restored";
                     else if (st === 'B') stDesc = "Bypassed";
                     else if (st === 'A') stDesc = "Alarm";
-                    result.event = `Read Command Response: Zone ${z} Status - ${stDesc}`;
-                    result.sensors = [{ zone: z, status: st, description: stDesc }];
+                    */
+                    let stDesc = "Normal";
+                    let statusCode = "0";
+                    if (st === 'B') {
+                        stDesc = "Bypassed";
+                        statusCode = "9";
+                    } else if (st === 'R') {
+                        stDesc = "Normal";
+                        statusCode = "0";
+                    } else if (st === 'U') {
+                        stDesc = "Disconnect";
+                        statusCode = "2";
+                    } else if (st === 'A') {
+                        stDesc = "Alert";
+                        statusCode = "1";
+                    }
+
+                    result.event = `Read Command Response: Zone ${z} Status - ${stDesc} (${statusCode})`;
+                    result.sensors = [{ zone: z, status: statusCode, rawStatus: st, statusCode: statusCode, description: stDesc }];
                 } else if (cmdType === '004' && secParts.length >= 4) {
                     const panelEn = secParts[2] === '1' ? 'Enabled' : 'Disabled';
                     const armSt = secParts[3];
@@ -205,15 +223,35 @@ function decodeSIA(message) {
                         const zoneNo = item.substring(0, 3);
                         const statusChar = item.substring(3);
 
+                        /*
                         let statusDesc = "Unknown";
                         if (statusChar === 'B') statusDesc = "Bypassed";
                         else if (statusChar === 'R') statusDesc = "Restored";
                         else if (statusChar === 'U') statusDesc = "Uninstalled";
                         else if (statusChar === 'A') statusDesc = "Alarm";
+                        */
+
+                        let statusDesc = "Normal";
+                        let statusCode = "0";
+                        if (statusChar === 'B') {
+                            statusDesc = "Bypassed";
+                            statusCode = "9";
+                        } else if (statusChar === 'R') {
+                            statusDesc = "Normal";
+                            statusCode = "0";
+                        } else if (statusChar === 'U') {
+                            statusDesc = "Disconnect";
+                            statusCode = "2";
+                        } else if (statusChar === 'A') {
+                            statusDesc = "Alert";
+                            statusCode = "1";
+                        }
 
                         sensors.push({
                             zone: zoneNo,
-                            status: statusChar,
+                            status: statusCode,
+                            rawStatus: statusChar,
+                            statusCode: statusCode,
                             description: statusDesc
                         });
                     }

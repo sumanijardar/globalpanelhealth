@@ -277,7 +277,7 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
           const zNum = parseInt(z.zone, 10);
           if (zNum >= 1 && zNum <= 60) {
             const colName = `zon${zNum}`;
-            const stVal = z.description || z.statusDescription || z.status || 'Uninstalled';
+            const stVal = (z.statusCode !== undefined) ? String(z.statusCode) : ((z.status !== undefined) ? String(z.status) : '0');
             columns.push(colName);
             placeholders.push('?');
             values.push(stVal);
