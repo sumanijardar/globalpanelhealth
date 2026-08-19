@@ -97,8 +97,8 @@ const apiServer = http.createServer(async (req, res) => {
       let handler = null;
 
       let [rows] = await pool.query(
-        "SELECT Panel_Make FROM sites WHERE NewPanelID = ? OR PanelID = ? LIMIT 1",
-        [account, account]
+        "SELECT Panel_Make FROM sites WHERE NewPanelID = ? LIMIT 1",
+        [account]
       );
 
       if (rows.length > 0) {

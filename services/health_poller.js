@@ -57,7 +57,7 @@ function waitForHealthDbInsert(panelId, expectedType, timeoutMs) {
 }
 
 async function processSinglePanelHealth(panel, index, total, config) {
-  const panelId = String(panel.NewPanelID || panel.PanelID || '').trim();
+  const panelId = String(panel.NewPanelID || '').trim();
   const rawMake = panel.Panel_Make || '';
   const ip = String(panel.dvrip || '').trim();
   const timeoutMs = (config.panel_timeout_seconds || 15) * 1000;
@@ -164,7 +164,7 @@ async function startHealthPoller(appConfig) {
 
   while (true) {
     try {
-      let query = "SELECT NewPanelID, PanelID, Panel_Make, dvrip, mac_id FROM sites WHERE dvrip IS NOT NULL AND dvrip != '' AND TRIM(dvrip) != ''";
+      let query = "SELECT NewPanelID, Panel_Make, dvrip FROM sites WHERE dvrip IS NOT NULL AND dvrip != '' AND TRIM(dvrip) != ''";
       const params = [];
 
       if (healthCfg.panel_make_filter && healthCfg.panel_make_filter.toUpperCase() !== 'ALL') {
@@ -192,8 +192,14 @@ async function startHealthPoller(appConfig) {
         await new Promise(r => setTimeout(r, 10000));
       }
     } catch (err) {
-      console.error(`❌ [HEALTH POLLER] Error in polling loop:`, err.message);
-      await new Promise(r => setTimeout(r, 5000));
+      if (err.code === 'ETIMEDOUT' || err.message.includes('ETIMEDOUT')) {
+        console.error(`❌ [HEALTH POLLER] Database Connection Timeout: ${err.message} (Host: ${appConfig.database.host}:${appConfig.database.port || 3306})`);
+        console.error(`   👉 Tip: Please ensure your network/VPN is connected to reach ${appConfig.database.host} or update database host in 'config.json'. Retrying in 10s...`);
+        await new Promise(r => setTimeout(r, 10000));
+      } else {
+        console.error(`❌ [HEALTH POLLER] Error in polling loop:`, err.message);
+        await new Promise(r => setTimeout(r, 5000));
+      }
     }
   }
 }

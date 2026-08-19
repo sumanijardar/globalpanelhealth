@@ -2,7 +2,6 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const pool = require("../config/database");
-const { panelConfigCache } = require("../config/routing");
 const decoders = require("../decoders");
 const decodeSIA = decoders.rass;
 const healthEvents = require("../services/health_events");
@@ -206,8 +205,8 @@ async function getPanelMake(currentAccount, remoteIp = null) {
     const strippedAcct = rawAcct.replace(/^0+/, '');
     const paddedAcct = rawAcct.padStart(6, '0');
     const [siteRows] = await pool.query(
-      "SELECT Panel_Make FROM sites WHERE NewPanelID = ? OR NewPanelID = ? OR NewPanelID = ? OR PanelID = ? OR PanelID = ? OR PanelID = ? OR dvrip = ? LIMIT 1",
-      [rawAcct, strippedAcct, paddedAcct, rawAcct, strippedAcct, paddedAcct, remoteIp || '']
+      "SELECT Panel_Make FROM sites WHERE NewPanelID = ? OR NewPanelID = ? OR NewPanelID = ? OR dvrip = ? LIMIT 1",
+      [rawAcct, strippedAcct, paddedAcct, remoteIp || '']
     );
     if (siteRows && siteRows.length > 0 && siteRows[0].Panel_Make) {
       panelName = siteRows[0].Panel_Make;
