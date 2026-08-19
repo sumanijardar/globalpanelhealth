@@ -1,11 +1,11 @@
 {
   "name": "globalpanelhealth",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "pkg . --target node18-win-x64 --output GlobalPanelHealth.exe"
+    "build": "node build_exe.js"
   },
   "keywords": [],
   "author": "",
@@ -22,7 +22,8 @@
       "decoders/**/*",
       "config/**/*",
       "protocols/**/*",
-      "routes/**/*"
+      "routes/**/*",
+      "package.json"
     ]
   },
   "devDependencies": {

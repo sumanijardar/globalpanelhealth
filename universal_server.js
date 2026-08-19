@@ -11,14 +11,17 @@ const raxProtocol = require("./protocols/rax");
 const securicoProtocol = require("./protocols/securico");
 const intellitechProtocol = require("./protocols/intellitech");
 const { startHealthPoller } = require("./services/health_poller");
+const pkg = require("./package.json");
 
 // Load master configuration
 const appConfig = loadConfig();
 
 // Start TCP / HTTP Protocol Servers
-console.log("\n=================================");
+console.log("\n==================================================");
+console.log(`🌐 GLOBAL PANEL HEALTH SERVER (v${pkg.version || '1.0.0'})`);
+console.log("==================================================");
 console.log("Starting Protocol Managers...");
-console.log("=================================");
+console.log("--------------------------------------------------");
 
 if (appConfig.protocols.mayur && appConfig.protocols.mayur.enabled) {
   const port = appConfig.protocols.mayur.port || 9999;
