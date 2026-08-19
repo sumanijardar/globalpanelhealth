@@ -15,20 +15,20 @@ const defaultConfig = {
   api_port: 3000,
   health_check: {
     enabled: true,
-    check_zone_status: true,
-    check_relay_status: true,
+    check_zone_status: false,
+    check_relay_status: false,
     panel_timeout_seconds: 15,
     delay_between_panels_ms: 1000,
     cycle_interval_seconds: 10,
     panel_make_filter: "ALL"
   },
   protocols: {
-    mayur: { enabled: true, port: 9999 },
-    rass: { enabled: true, port: 6550 },
-    smarti: { enabled: true, port: 5500 },
-    rax: { enabled: true, port: 5502 },
-    securico: { enabled: true, port: 5503 },
-    intellitech: { enabled: true, port: 3001 }
+    mayur: { enabled: false, port: 9999 },
+    rass: { enabled: false, port: 6550 },
+    smarti: { enabled: false, port: 5500 },
+    rax: { enabled: false, port: 5502 },
+    securico: { enabled: false, port: 5503 },
+    intellitech: { enabled: false, port: 3001 }
   }
 };
 
@@ -40,7 +40,7 @@ function loadConfig() {
     if (fs.existsSync(configPath)) {
       const fileData = fs.readFileSync(configPath, 'utf8');
       const parsedConfig = JSON.parse(fileData);
-      
+
       config = {
         ...defaultConfig,
         ...parsedConfig,
@@ -57,7 +57,7 @@ function loadConfig() {
           ...(parsedConfig.protocols || {})
         }
       };
-      
+
       for (const key of Object.keys(defaultConfig.protocols)) {
         config.protocols[key] = {
           ...defaultConfig.protocols[key],
