@@ -231,7 +231,7 @@ function handleSocketEvents(socket, remoteIp, initialAccount = null) {
           }
         });
 
-        const [rows] = await pool.query("SELECT id FROM panel_health WHERE panelid = ? LIMIT 1", [currentAccount]);
+        const [rows] = await pool.query("SELECT panelid FROM panel_health WHERE panelid = ? LIMIT 1", [currentAccount]);
         if (rows && rows.length > 0) {
           const updateQuery = `UPDATE panel_health SET ${setQueryArr.join(', ')} WHERE panelid = ?`;
           await pool.query(updateQuery, [...setValues, currentAccount]);
@@ -312,7 +312,7 @@ async function processRpsDb(decoded, currentAccount, remoteIp) {
       }
     });
 
-    const [rows] = await pool.query("SELECT id FROM panel_health WHERE panelid = ? LIMIT 1", [currentAccount]);
+    const [rows] = await pool.query("SELECT panelid FROM panel_health WHERE panelid = ? LIMIT 1", [currentAccount]);
     if (rows && rows.length > 0) {
       const updateQuery = `UPDATE panel_health SET ${setQueryArr.join(', ')} WHERE panelid = ?`;
       await pool.query(updateQuery, [...setValues, currentAccount]);
