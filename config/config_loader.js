@@ -3,10 +3,10 @@ const path = require('path');
 
 const defaultConfig = {
   database: {
-    host: "10.15.10.194",
+    host: "localhost",
     port: 3306,
-    user: "sarsafe2",
-    password: "Sarsoft@2026#",
+    user: "root",
+    password: "",
     database: "esurv",
     waitForConnections: true,
     connectionLimit: 10,
